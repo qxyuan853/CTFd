@@ -6,7 +6,7 @@ from flask_restx import Namespace, Resource
 from CTFd.api.v1.helpers.request import validate_args
 from CTFd.api.v1.helpers.schemas import sqlalchemy_to_pydantic
 from CTFd.api.v1.schemas import APIDetailedSuccessResponse, APIListSuccessResponse
-from CTFd.cache import clear_standings
+from CTFd.cache import cache, clear_standings
 from CTFd.constants import RawEnum
 from CTFd.models import (
     Challenges,
@@ -168,60 +168,80 @@ class UnlockList(Resource):
                 if not unlock_ids >= prereqs:
                     abort(403)
 
-            # We should use the team's score if in teams mode
-            # user.account gives the appropriate account based on team mode
-            # Use get_score with admin to get the account's full score value
-            if target.cost > user.account.get_score(admin=True):
+            # Serialize hint purchases per account. The score check below and the
+            # Award that pays for the hint have to happen as one step: otherwise
+            # concurrent unlocks all read the pre-purchase score, all pass the
+            # check, and the account buys hints it cannot afford and goes negative.
+            # Same SETNX approach as the max attempts submission lock.
+            # TODO CTFd 4.0 We should implement this with Redlock instead of SETNX
+            lock_key = f"hint_unlock_lock_{user.account_id}"
+            if not cache.add(lock_key, 1, timeout=30):
                 return (
                     {
                         "success": False,
                         "errors": {
-                            "score": "You do not have enough points to unlock this hint"
+                            "target": "Another unlock is already being processed. Try again shortly."
                         },
                     },
-                    400,
+                    429,
                 )
+            try:
+                # We should use the team's score if in teams mode
+                # user.account gives the appropriate account based on team mode
+                # Use get_score with admin to get the account's full score value
+                if target.cost > user.account.get_score(admin=True):
+                    return (
+                        {
+                            "success": False,
+                            "errors": {
+                                "score": "You do not have enough points to unlock this hint"
+                            },
+                        },
+                        400,
+                    )
 
-            schema = UnlockSchema()
-            response = schema.load(req, session=db.session)
+                schema = UnlockSchema()
+                response = schema.load(req, session=db.session)
 
-            if response.errors:
-                return {"success": False, "errors": response.errors}, 400
+                if response.errors:
+                    return {"success": False, "errors": response.errors}, 400
 
-            response.data.ip = get_ip(req=request)
+                response.data.ip = get_ip(req=request)
 
-            # Search for an existing unlock that matches the target and type
-            # And matches either the requesting user id or the requesting team id
-            existing = Unlocks.query.filter(
-                Unlocks.target == req["target"],
-                Unlocks.type == req["type"],
-                Unlocks.account_id == user.account_id,
-            ).first()
-            if existing:
-                return (
-                    {
-                        "success": False,
-                        "errors": {"target": "You've already unlocked this target"},
-                    },
-                    400,
-                )
+                # Search for an existing unlock that matches the target and type
+                # And matches either the requesting user id or the requesting team id
+                existing = Unlocks.query.filter(
+                    Unlocks.target == req["target"],
+                    Unlocks.type == req["type"],
+                    Unlocks.account_id == user.account_id,
+                ).first()
+                if existing:
+                    return (
+                        {
+                            "success": False,
+                            "errors": {"target": "You've already unlocked this target"},
+                        },
+                        400,
+                    )
 
-            db.session.add(response.data)
+                db.session.add(response.data)
 
-            award_schema = AwardSchema()
-            award = {
-                "user_id": user.id,
-                "team_id": user.team_id,
-                "name": target.name,
-                "description": target.description,
-                "value": (-target.cost),
-                "category": target.category,
-            }
+                award_schema = AwardSchema()
+                award = {
+                    "user_id": user.id,
+                    "team_id": user.team_id,
+                    "name": target.name,
+                    "description": target.description,
+                    "value": (-target.cost),
+                    "category": target.category,
+                }
 
-            award = award_schema.load(award)
-            db.session.add(award.data)
-            db.session.commit()
-            clear_standings()
+                award = award_schema.load(award)
+                db.session.add(award.data)
+                db.session.commit()
+                clear_standings()
+            finally:
+                cache.delete(lock_key)
 
             response = schema.dump(response.data)
 
